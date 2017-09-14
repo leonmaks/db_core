@@ -145,10 +145,10 @@ class Db():
             except psycopg2.Error as e_:
                 # TODO - test exception handling when closing connection
                 # Check ignore error codes
-                def error_ignore(e_, **kwargs):
+                def __ignore_errs(e_, **kwargs):
                     ignore_errs_ = kwargs.get("ignore_errs")
                     if ignore_errs_ and (e_.pgcode in ignore_errs_): return True
-                if e_.pgcode and error_ignore(e_, **kwargs):
+                if e_.pgcode and __ignore_errs(e_, **kwargs):
                     _log.warning("Can't execute (ignored) STMT [%s] ARGS %s (connected=%s, pgcode=%s, class=%s): %s" % (
                         stmt_, args, self.is_connected(), e_.pgcode, e_.__class__.__name__, e_))
                     break
