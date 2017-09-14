@@ -15,7 +15,7 @@ _log = logging.getLogger(__name__)
 
 RECONNECT_ATTEMPTS = 0
 RECONNECT_PAUSE = 500
-DB_PORT = "5432"
+PG_DEFAULT_PORT = "5432"
 
 
 def debug_statement(**kwargs):
@@ -38,38 +38,44 @@ class Db():
         self.__set_parms(parms, **kwargs)
 
     def __set_parms(self, parms, **kwargs):
+        changed_ = 0
+
+        def __set_if_changed(val, dic, key, default):
+            nonlocal changed_
+            changed_val_ = dic.get(key, default)
+            if changed_val_ != val: changed_ += 1; return changed_val_
+            return val
+
         # USER
-        self.__user = parms.get("USER", None)
-        if not self.__user:
-            raise t.ConfigError("USER is not defined")
+        self.__user = __set_if_changed(self.__user, parms, "USER", None)
+        if not self.__user: raise t.ConfigError("USER is not defined")
         # PASSWORD
-        self.__pass = parms.get("PASSWORD", None)
-        if not self.__pass:
-            raise t.ConfigError("PASSWORD is not defined")
-        # DATABASE
-        self.__db = parms.get("DATABASE", None)
-        if not self.__db:
-            if kwargs.get("database_equals_user"):
-                self.__db = self.__user
-            else:
-                self.__db = "postgres"
+        self.__pass = __set_if_changed(self.__pass, parms, "PASSWORD", None)
+        if not self.__pass: raise t.ConfigError("PASSWORD is not defined")
+        # DB
+        self.__db = __set_if_changed(self.__db, parms, "DATABASE", kwargs.get("database_equals_user") and self.__user or "postgres")
         # HOST
-        self.__host = parms.get("HOST", None)
-        if not self.__host:
-            self.__host = "localhost"
+        self.__host = __set_if_changed(self.__host, parms, "HOST", "localhost")
         # PORT
-        self.__port = parms.get("PORT", DB_PORT)
+        self.__port = __set_if_changed(self.__port, parms, "PORT", PG_DEFAULT_PORT)
+
+        return changed_ and True or False
 
     def set_parms(self, parms, **kwargs):
-        # Close connection if open
-        self.close(**kwargs)
-        self.__set_parms(parms, **kwargs)
+        # Set parameters
+        if self.__set_parms(parms, **kwargs):
+            # Close connection if any parameter updated
+            _log.debug("closing db connection")
+            self.close(**kwargs)
+
+    def is_connected(self):
+        if self.__conn and self.__conn.closed == 0: return True
+        return False
 
     def __str__(self):
         return "%s @ %s : %s (connected=%s)" % (
             self.__user == self.__db and self.__user or "%s(%s)" % (self.__user, self.__db),
-            self.__host, self.__port, self.__get_conn().closed and False or True,
-        )
+            self.__host, self.__port, self.is_connected(), )
 
     def close(self, **kwargs):
         if self.__conn:
@@ -84,9 +90,6 @@ class Db():
 
     def encoding(self):
         return self.__get_conn().encoding
-
-    def is_connected(self):
-        return self.__conn and True or False
 
     def connect(self, **kwargs):
         if debug_statement(**kwargs):
@@ -108,8 +111,7 @@ class Db():
                     " port=", self.__port,
                 ])
             )
-            if debug_statement(**kwargs):
-                _log.debug("Connected to %s" % self)
+            if debug_statement(**kwargs): _log.debug("Connected to %s" % self)
         except psycopg2.Error as e_:
             raise t.DbConnectError("Cannot connect to %s: %s" % (self, e_))
         return self.__conn
@@ -132,7 +134,6 @@ class Db():
         attempts_ = kwargs.get("reconnect_attempts", RECONNECT_ATTEMPTS)
         pause_ = kwargs.get("reconnect_pause", RECONNECT_PAUSE)
         stmt_ = t.lotovts(stmt)
-
         csr_ = None
         while attempts_ >= 0:
             try:
@@ -141,25 +142,25 @@ class Db():
                 csr_ = self.__get_conn(**kwargs).cursor()
                 csr_.execute(stmt_, args)
                 attempts_ = -1 # Stop reconnecting on success
-
             except psycopg2.Error as e_:
+                # TODO - test exception handling when closing connection
                 # Check ignore error codes
-                def __ignore(**kwargs):
+                def error_ignore(e_, **kwargs):
                     ignore_errs_ = kwargs.get("ignore_errs")
-                    if ignore_errs_ and e_.pgcode in ignore_errs_: return True
-                if __ignore(**kwargs):
-                    _log.warning("Can't execute (ignored) STMT [%s] ARGS %s (pgcode=%s, class=%s): %s" % (
-                        stmt_, args, e_.pgcode, e_.__class__.__name__, e_))
+                    if ignore_errs_ and (e_.pgcode in ignore_errs_): return True
+                if e_.pgcode and error_ignore(e_, **kwargs):
+                    _log.warning("Can't execute (ignored) STMT [%s] ARGS %s (connected=%s, pgcode=%s, class=%s): %s" % (
+                        stmt_, args, self.is_connected(), e_.pgcode, e_.__class__.__name__, e_))
                     break
                 # If error not related to closed connection
                 # or number of attemts exhausted - raise exception
                 if not self.__get_conn().closed or attempts_ <= 0 or e_.pgcode in ("25P02", ):
-                    raise t.DbExecuteError("Can't execute STMT [%s] ARGS %s (pgcode=%s, class=%s): %s" % (
-                        stmt_, args, e_.pgcode, e_.__class__.__name__, e_))
+                    raise t.DbExecuteError("Can't execute STMT [%s] ARGS %s (connected=%s, pgcode=%s, class=%s): %s" % (
+                        stmt_, args, self.is_connected(), e_.pgcode, e_.__class__.__name__, e_))
                 # ... else log warning and keep trying execution
                 if not kwargs.get("no_logging"):
-                    _log.warning("Can't execute STMT [%s] ARGS %s (pgcode=%s, class=%s): %s" % (
-                        stmt_, args, e_.pgcode, e_.__class__.__name__, e_))
+                    _log.warning("Can't execute STMT [%s] ARGS %s (connected=%s, pgcode=%s, class=%s): %s" % (
+                        stmt_, args, self.is_connected(), e_.pgcode, e_.__class__.__name__, e_))
                 self.cursor_close(csr_)
                 time.sleep(pause_ / 1000.0)
                 self.connect(reopen=True, **kwargs)
@@ -203,16 +204,32 @@ class Db():
         return rowcount_
 
 
-def __test():
+def test():
+    import time
 
-    DB = {
+    db_parms_ = {
         "USER": "ffba_backup",
         "PASSWORD": "f__",
     }
 
-    db_ = Db(DB, database_equals_user=True, debug="statement")
-    db_.connect(debug="statement")
-    db_.execute("DROP TABLE NON_EXISTENT_TABLE", ignore_errs=(psycopg2.errorcodes.UNDEFINED_TABLE), debug="statement")
+    conn_ = Db(db_parms_, database_equals_user=True, debug="statement")
+    conn_.connect(debug="statement")
+
+    _log.debug("setting parms without changes...")
+    conn_.set_parms(db_parms_, database_equals_user=True)
+
+    db_parms_ = {
+        "USER": "ffba_170908",
+        "PASSWORD": "f__",
+    }
+
+    _log.debug("setting changed parms...")
+    conn_.set_parms(db_parms_)
+    conn_.connect(debug="statement")
+
+    time.sleep(20) # kill DB connection during the pause
+
+    conn_.execute("DROP TABLE NON_EXISTENT_TABLE", ignore_errs=(psycopg2.errorcodes.UNDEFINED_TABLE), reconnect_attempts=1, debug="statement")
 
     # csr_ = None
     # try:
@@ -223,4 +240,4 @@ def __test():
 
 
 if __name__ == "__main__":
-    __test()
+    test()
