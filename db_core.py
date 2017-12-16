@@ -1,12 +1,17 @@
-"""
-DB core functions
-"""
+""" DB core functions 171203_2100 """
 import logging
 import time
 import psycopg2
 import psycopg2.errorcodes
 
-import tittles as t # pylint: disable-msg=E0401
+import mod
+_t = mod.Mod("tittles")  # pylint: disable-msg=C0103
+
+def mods_rld(recursive=False):
+    """Reload modules"""
+    _t.reload()
+    if recursive:   # Nothing to reload recursively
+        pass
 
 
 if __name__ == "__main__":
@@ -26,6 +31,19 @@ def _debug_stmt(**kwargs):
         return True
 
 
+def db_apply_commit(ctx, **kwargs):
+    for cn_ in ctx:
+        conn_ = ctx[cn_]
+        if conn_["stmt"] and kwargs.get("apply"): conn_["conn"].execute_batch(conn_["stmt"], **kwargs)
+        if kwargs.get("commit"): conn_["conn"].commit()
+        if conn_["stmt"] and kwargs.get("info"):
+            if len(conn_["stmt"]) > 1:
+                _log.info("CONN: %s; STMT:%s" % (conn_["conn"], "\n%s;" % ";\n".join(conn_["stmt"])))
+            else:
+                _log.info("CONN: %s; STMT: %s;" % (conn_["conn"], conn_["stmt"][0]))
+        conn_["stmt"] = []
+
+
 class Db():
     """DB connection class with core functions"""
 
@@ -39,7 +57,7 @@ class Db():
         self.__set_parms(parms, **kwargs)
 
     def __str__(self):
-        return "%s @ %s : %s (connected=%s, id=%s)" % (
+        return "%s @ %s : %s / connected=%s; id=%s" % (
             self.__user == self.__dbname and self.__user or "%s(%s)" % (self.__user, self.__dbname),
             self.__host, self.__port, self.is_connected(), hex(id(self)), )
 
@@ -48,7 +66,7 @@ class Db():
 
         def __set_if_changed(current_val, dic, key, default=None):
             nonlocal changed_
-            changed_val_ = t.nvl(dic.get(key, default), default)
+            changed_val_ = _t.m.nvl(dic.get(key, default), default)
             if changed_val_ and changed_val_ != current_val:
                 changed_ += 1
                 return changed_val_
@@ -57,11 +75,11 @@ class Db():
         # USER
         self.__user = __set_if_changed(self.__user, parms, "USER")
         if not self.__user:
-            raise t.ConfigError("USER is not defined")
+            raise _t.m.ConfigError("USER is not defined")
         # PASSWORD
         self.__pass = __set_if_changed(self.__pass, parms, "PASSWORD")
         if not self.__pass:
-            raise t.ConfigError("PASSWORD is not defined")
+            raise _t.m.ConfigError("PASSWORD is not defined")
         # DB
         self.__dbname = __set_if_changed(
             self.__dbname, parms, "DATABASE",
@@ -86,7 +104,7 @@ class Db():
     def connect(self, **kwargs):
         """Create new database connection"""
         if _debug_stmt(**kwargs):
-            _log.debug("Connect to %s (reopen=%s)", self, kwargs.get("reopen", False))
+            _log.debug("Connect to %s; reopen=%s", self, kwargs.get("reopen", False))
         if self.is_connected():
             # If reopen - close connection
             if kwargs.get("reopen"):
@@ -104,7 +122,7 @@ class Db():
                 ])
             )
         except psycopg2.Error as e_:    # pylint: disable-msg=C0103
-            raise t.DbConnectError("Can't connect to %s: %s" % (self, e_))
+            raise _t.m.DbConnectError("Can't connect to %s: %s" % (self, e_))
         return self.__conn
 
     def __get_conn(self, **kwargs):
@@ -172,11 +190,9 @@ class Db():
         pause_ = kwargs.get("reconnect_pause", RECONNECT_PAUSE)
 
         # Compose statement
-        stmt_ = t.lovts(stmt)
+        stmt_ = _t.m.lovts(stmt)
         if _debug_stmt(**kwargs):
-            _log.debug(
-                "STMT [%s] ARGS %s (attempts=%s, pause=%s, id=%s)",
-                stmt_, args, attempts_, pause_, hex(id(self)))
+            _log.debug("STMT [%s] ARGS %s (attempts=%s, pause=%s, id=%s)", stmt_, args, attempts_, pause_, hex(id(self)))
 
         # Do execute several times
         while attempts_ >= 0:
@@ -205,16 +221,17 @@ class Db():
                 # If error not related to closed connection
                 # or number of attemts exhausted - raise exception
                 if not self.__get_conn().closed or attempts_ <= 0:
-                    raise t.DbExecuteError((
-                        "Can't execute STMT [%s] ARGS %s"
-                        " (connected=%s, pgcode=%s, class=%s, id=%s): %s") % (
-                            stmt_, args, self.is_connected(),
-                            e_.pgcode, e_.__class__.__name__, hex(id(self)), e_))
+                    raise _t.m.msg_exc(("Can't execute STMT [%s] ARGS %s / connected=%s; pgcode=%s; class=%s; id=%s: %s") % (stmt_, args, self.is_connected(), e_.pgcode, e_.__class__.__name__, hex(id(self)), e_))
+                    # raise _t.m.DbExecuteError((
+                    #     "Can't execute STMT [%s] ARGS %s"
+                    #     " (connected=%s, pgcode=%s, class=%s, id=%s): %s") % (
+                    #         stmt_, args, self.is_connected(),
+                    #         e_.pgcode, e_.__class__.__name__, hex(id(self)), e_))
 
                 # ... else log warning and keep trying execution
                 if not kwargs.get("no_logging"):
                     _log.warning(
-                        ("Can't execute STMT [%s] ARGS %s"
+                        ("Can't execute (will try again) STMT [%s] ARGS %s"
                          " (connected=%s, pgcode=%s, class=%s, id=%s): %s"),
                         stmt_, args, self.is_connected(),
                         e_.pgcode, e_.__class__.__name__, hex(id(self)), e_)
@@ -252,7 +269,7 @@ class Db():
         """Execute DB statement"""
         rowcount_ = self.__exec_reconn_wrapper(stmt, args, self.__execute, **kwargs)
         if kwargs.get("commit") == "statement":
-            self.commit(**kwargs)
+            self.commit()
         return rowcount_
 
     def execute_batch(self, batch, **kwargs):
@@ -261,7 +278,7 @@ class Db():
         for s_ in batch:    # pylint: disable-msg=C0103
             rowcount_ += self.execute(s_, **kwargs)
         if kwargs.get("commit") == "batch":
-            self.commit(**kwargs)
+            self.commit()
         return rowcount_
 
     def __del__(self):
@@ -285,6 +302,7 @@ def test():
     conn_.execute("insert into xx (i, t) values (1, 'text 1')")
     conn_.execute("insert into xx_ (i, t) values (2, 'text 2')", ignore_errs=("42P01",))
     conn_.execute("insert into xx (i, t) values (3, 'text 3')")
+    _log.debug("RESULTS:")
     for r_ in conn_.select_all("select * from xx"): # pylint: disable-msg=C0103
         _log.debug("R: %s", (r_, ))
 
